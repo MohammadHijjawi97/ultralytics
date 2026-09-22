@@ -148,7 +148,14 @@ def migrate_deim_state(model, source: dict) -> dict:
     return migrated
 
 
-def build_clean_model(yaml_path: Path, source_model, nc: int | None, dtype: torch.dtype, allow_truncation: bool = False):
+def build_clean_model(
+    yaml_path: Path,
+    source_model,
+    nc: int | None,
+    dtype: torch.dtype,
+    allow_truncation: bool = False,
+    preserve_dfl_fp32: bool = False,
+):
     """Construct a clean-branch ``YOLODETRDetectionModel``, load source state_dict, and propagate metadata.
 
     Args:
@@ -158,6 +165,7 @@ def build_clean_model(yaml_path: Path, source_model, nc: int | None, dtype: torc
         dtype (torch.dtype): Target parameter dtype.
         allow_truncation (bool): If True, source keys absent from the target model are dropped silently (e.g. ndl=6
             source loaded into an ndl=4 YAML). Missing target keys still abort.
+        preserve_dfl_fp32 (bool): Keep the fixed DFL projection in FP32, matching public DEIM release checkpoints.
 
     Returns:
         (YOLODETRDetectionModel): Loaded, eval-mode model in target dtype.
@@ -177,7 +185,12 @@ def build_clean_model(yaml_path: Path, source_model, nc: int | None, dtype: torc
     if missing:
         raise AssertionError(f"missing target keys: {missing[:5]}")
     m.load_state_dict(src_sd, strict=True)
+    dfl = getattr(m.model[-1], "dfl", None)
+    dfl_weight = dfl.conv.weight.detach().clone() if preserve_dfl_fp32 and hasattr(dfl, "conv") else None
     m.to(dtype).eval()
+    if dfl_weight is not None:
+        dfl.float()
+        dfl.conv.weight.data.copy_(dfl_weight)
     m.task = "detect"
     m.yaml_file = Path(yaml_path).name
     for attr in ("names", "nc", "stride", "args"):
@@ -262,10 +275,56 @@ def apply_release_metadata(train_args: dict, yaml_path: Path) -> dict:
     return changed
 
 
-def save_clean(src_ckpt: dict, model, out: Path) -> None:
+def apply_release_model_metadata(model, yaml_path: Path) -> bool:
+    """Match the public release's basename-only YAML metadata and abbreviated default DEIM arguments."""
+    model.yaml_file = yaml_path.name
+    model.yaml["yaml_file"] = yaml_path.name
+    head = model.yaml.get("head")
+    if not head or head[-1][2] not in {"DEIMDecoder", "DeimDecoder"}:
+        return False
+
+    layer = head[-1]
+    args = layer[3]
+    defaults = (2048, 0.0, "silu", -1, 100, 0.5, 1.0, 32, 4.0, "silu", True, False, False, True)
+    tail = args[6:]
+    if tail != list(defaults[: len(tail)]):
+        raise AssertionError(f"cannot abbreviate non-default DEIMDecoder arguments: {tail}")
+
+    changed = layer[2] != "DEIMDecoder" or len(args) > 6
+    layer[2] = "DEIMDecoder"
+    layer[3] = args[:6]
+    return changed
+
+
+def apply_release_model_class(model) -> bool:
+    """Serialize DEIM release checkpoints under the stable public ``DetectionModel`` class path."""
+    from ultralytics.nn.tasks import DetectionModel
+
+    if not isinstance(model, DetectionModel):
+        raise TypeError(f"release model must inherit DetectionModel, got {type(model).__module__}.{type(model).__name__}")
+    changed = type(model) is not DetectionModel
+    model.__class__ = DetectionModel
+    return changed
+
+
+def save_clean(src_ckpt: dict, model, out: Path, release: bool = False) -> None:
     """Save the rebuilt model in a checkpoint dict that mirrors the source shape."""
+    if release:
+        changed = apply_release_model_class(model)
+        print(f"  release-model-class: DetectionModel (changed={changed})")
     new_ckpt = {**src_ckpt, "model": model}
+    if release:
+        new_ckpt.update(epoch=-1, best_fitness=None, ema=None, optimizer=None, updates=None, scaler=None)
     torch.save(new_ckpt, out)
+    if release:
+        from ultralytics.nn.tasks import DetectionModel
+
+        saved_model = torch.load(out, map_location="cpu", weights_only=False)["model"]
+        if type(saved_model) is not DetectionModel:
+            raise AssertionError(
+                f"release checkpoint serialized {type(saved_model).__module__}.{type(saved_model).__name__}, "
+                "expected ultralytics.nn.tasks.DetectionModel"
+            )
 
 
 def verify_inference(out: Path, bus_path: Path) -> None:
@@ -273,9 +332,9 @@ def verify_inference(out: Path, bus_path: Path) -> None:
     import numpy as np
     from PIL import Image
 
-    from ultralytics import YOLODETR
+    from ultralytics import YOLO
 
-    m = YOLODETR(str(out))
+    m = YOLO(str(out))
     mdt = next(m.model.parameters()).dtype
     img = Image.open(bus_path).convert("RGB").resize((640, 640))
     arr = np.asarray(img, dtype=np.float32) / 255.0
@@ -286,7 +345,10 @@ def verify_inference(out: Path, bus_path: Path) -> None:
     y = out_t[0] if isinstance(out_t, tuple) else out_t
     top = y[0, y[0, :, 4].argsort(descending=True)][:6]
     names = getattr(m.model, "names", {}) or {}
-    print(f"verify: loaded class={type(m).__name__} dtype={mdt} top-6 detections on {bus_path.name}:")
+    print(
+        f"verify: facade={type(m).__name__} model={type(m.model).__name__} "
+        f"dtype={mdt} top-6 detections on {bus_path.name}:"
+    )
     for d in top:
         cls = int(d[5])
         bb = [round(b, 3) for b in d[:4].tolist()]
@@ -328,7 +390,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--release-metadata",
         action="store_true",
-        help="normalize public train_args model/data/cfg/project/name/pretrained fields from the target YAML",
+        help="apply public-release args/YAML cosmetics, stable DetectionModel pickle path, and stripped training state",
     )
     return p.parse_args()
 
@@ -360,7 +422,14 @@ def main() -> None:
         )
 
     print(f"rebuilding under clean graph from: {args.yaml} (nc={nc if nc is not None else 'YAML default'})")
-    model = build_clean_model(args.yaml, src_model, nc, dtype, allow_truncation=args.allow_truncation)
+    model = build_clean_model(
+        args.yaml,
+        src_model,
+        nc,
+        dtype,
+        allow_truncation=args.allow_truncation,
+        preserve_dfl_fp32=args.release_metadata,
+    )
 
     if not src_names and names:
         model.names = names
@@ -381,33 +450,40 @@ def main() -> None:
             m_args["imgsz"] = args.imgsz
         print(f"  overrode deployment imgsz -> {args.imgsz}")
 
-    if args.clean_args:
+    if args.clean_args or args.release_metadata:
+        clean_label = "release-clean-args" if args.release_metadata else "clean-args"
         ta = src.get("train_args")
         if isinstance(ta, dict):
             dropped, old_name = clean_train_args(ta)
             if dropped:
-                print(f"  clean-args (train_args): dropped {len(dropped)} key(s): {dropped}")
+                print(f"  {clean_label} (train_args): dropped {len(dropped)} key(s): {dropped}")
             if old_name is not None:
-                print(f"  clean-args (train_args): renamed {old_name!r} -> {ta['name']!r}")
+                print(f"  {clean_label} (train_args): renamed {old_name!r} -> {ta['name']!r}")
         m_args = getattr(model, "args", None)
         m_dict = m_args if isinstance(m_args, dict) else (vars(m_args) if m_args is not None else None)
         if m_dict is not None:
             m_dropped, m_old = clean_train_args(m_dict)
             if m_dropped:
-                print(f"  clean-args (model.args): dropped {len(m_dropped)} key(s)")
+                print(f"  {clean_label} (model.args): dropped {len(m_dropped)} key(s)")
             if m_old is not None:
-                print(f"  clean-args (model.args): renamed to {m_dict['name']!r}")
+                print(f"  {clean_label} (model.args): renamed to {m_dict['name']!r}")
 
-    model.yaml["yaml_file"] = args.yaml.name
     if args.release_metadata:
         ta = src.get("train_args")
         if not isinstance(ta, dict):
             raise TypeError("--release-metadata requires a train_args dictionary")
         changed = apply_release_metadata(ta, args.yaml)
         print(f"  release-metadata: {changed}")
+        abbreviated = apply_release_model_metadata(model, args.yaml)
+        print(
+            f"  release-model-metadata: abbreviated_deim_args={abbreviated}, "
+            f"dfl_dtype={model.model[-1].dfl.conv.weight.dtype}"
+        )
+    else:
+        model.yaml["yaml_file"] = args.yaml.name
 
     print(f"saving: {out}")
-    save_clean(src, model, out)
+    save_clean(src, model, out, release=args.release_metadata)
     print(f"  size: {out.stat().st_size / 1e6:.1f} MB")
 
     if args.copy_to:
