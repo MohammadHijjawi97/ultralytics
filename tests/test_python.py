@@ -1141,6 +1141,16 @@ def test_annotator_depth_map():
     assert ann.result().shape == (16, 16, 3)
 
 
+def test_save_one_box_accepts_list_of_tensors():
+    """save_one_box still accepts a sequence of tensor coordinates via torch.stack."""
+    from ultralytics.utils.plotting import save_one_box
+
+    im = np.zeros((200, 200, 3), dtype=np.uint8)
+    xyxy = [torch.tensor(50), torch.tensor(50), torch.tensor(150), torch.tensor(150)]
+    crop = save_one_box(xyxy, im, save=False)
+    assert crop.shape[0] > 0 and crop.shape[1] > 0
+
+
 def test_dense_result_tensor_indexing():
     """Valid indices keep the intact map on SemanticMask/DepthMap; out-of-range raises; empty selections zero len."""
     from ultralytics.engine.results import DepthMap, SemanticMask

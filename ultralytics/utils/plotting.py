@@ -804,8 +804,14 @@ def save_one_box(
         >>> im = cv2.imread("image.jpg")
         >>> cropped_im = save_one_box(xyxy, im, file="cropped.jpg", square=True)
     """
-    if not isinstance(xyxy, torch.Tensor):
-        xyxy = torch.as_tensor(xyxy)  # list, tuple, or ndarray
+    if isinstance(xyxy, torch.Tensor):
+        pass
+    elif isinstance(xyxy, np.ndarray):
+        xyxy = torch.from_numpy(xyxy)
+    elif xyxy and isinstance(xyxy[0], torch.Tensor):
+        xyxy = torch.stack(list(xyxy))
+    else:
+        xyxy = torch.as_tensor(xyxy)  # numeric list or tuple
     b = ops.xyxy2xywh(xyxy.view(-1, 4))  # boxes
     if square:
         b[:, 2:] = b[:, 2:].max(1)[0].unsqueeze(1)  # attempt rectangle to square
